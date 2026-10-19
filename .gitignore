@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.lnk
+laporan-driver-hp-*.txt
+~*.pdf.part
