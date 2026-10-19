@@ -12,7 +12,7 @@ Modul Python yang dipakai: `pywin32`, `pillow`, `pytwain`. Semuanya dipasang oto
 
 ## Pasang
 
-1. Simpan folder ini di lokasi tetap, misalnya `C:\BIT2026\Pindai`.
+1. Simpan folder ini di lokasi tetap, misalnya `C:\Pindai`.
 2. Jalankan `Pasang Pindai.bat`. File ini memasang modul, membuat shortcut di Desktop dan Start Menu, lalu membuka Pindai.
 3. Untuk menyematkan ke taskbar: buka Start, ketik Pindai, klik kanan, pilih Pin to taskbar.
 
