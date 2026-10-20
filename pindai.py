@@ -8,16 +8,28 @@ orientasi, warna otomatis, buang halaman kosong) dikerjakan driver HP seperti di
 """
 
 import ctypes
+import hashlib
+import hmac
+import html
+import io
+import ipaddress
 import json
-import sys
 import os
 import queue
 import re
+import secrets
 import shutil
+import socket
+import sys
 import tempfile
 import threading
+import time
+import zipfile
 from datetime import datetime
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -154,6 +166,8 @@ DEFAULTS = {
     "contrast": 0,
     "folder": str(Path.home() / "Documents" / "Hasil Scan"),
     "save_format": "jpg",
+    "share_enabled": False,
+    "share_hash": "",
 }
 
 ACCENT = "#1F5FA8"
@@ -165,6 +179,8 @@ PRIMARY_BTN = dict(bg=ACCENT, fg="white", activebackground=ACCENT_ACTIVE, active
 SECONDARY_BTN = dict(bg="#E9EAEC", fg="#1B1F24", activebackground="#DADCE0", activeforeground="#1B1F24",
                      disabledforeground="#80868E")
 THUMB_W, THUMB_H = 130, 180
+NET_PORT = 8765
+SESSION_TTL = 8 * 3600
 
 
 class ScanError(Exception):
@@ -902,6 +918,700 @@ def save_worker(pages, folder, base, quality, out_size, fmt, out_q):
     out_q.put(("save_done", saved, error, name))
 
 
+def build_opts(cfg):
+    """Ubah pengaturan (dari Pindai atau dari browser) menjadi opsi untuk worker scan."""
+    return {
+        "paper_name": cfg["paper"],
+        "handling": SIDES[cfg["side"]],
+        "intent": COLOR_MODES[cfg["color"]],
+        "dpi": int(cfg["dpi"]),
+        "paper": PAPER_SIZES_IN[cfg["paper"]],
+        "skip_blank": cfg["skip_blank"],
+        "auto_rotate": cfg["auto_rotate"],
+        "deskew": cfg["deskew"],
+        "auto_color": cfg["color"] == AUTO_COLOR,
+        "bw": cfg["color"] == BW,
+        "brightness": cfg["brightness"],
+        "contrast": cfg["contrast"],
+        "token": datetime.now().strftime("%H%M%S%f"),
+    }
+
+
+def worker_for(device_id):
+    kind, _, dev = device_id.partition(":")
+    return (twain_worker if kind == "twain" else scan_worker), dev
+
+
+def hash_password(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), 200_000).hex()
+    return f"{salt}${digest}"
+
+
+def check_password(password, stored):
+    salt, _, digest = (stored or "").partition("$")
+    if not salt or not digest:
+        return False
+    return hmac.compare_digest(hash_password(password, salt).partition("$")[2], digest)
+
+
+def lan_addresses():
+    found = set()
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Tidak mengirim apa pun; hanya meminta Windows memilih kartu jaringan yang dipakai.
+        probe.connect(("10.255.255.255", 1))
+        found.add(probe.getsockname()[0])
+        probe.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(ip for ip in found if not ip.startswith(("127.", "169.254.")))
+
+
+def render_jpeg(path, angle, box, quality=80):
+    with Image.open(path) as im:
+        im.draft("RGB", (box * 2, box * 2))
+        im = rotated(im.convert("RGB") if im.mode not in ("RGB", "L") else im.copy(), angle)
+    im.thumbnail((box, box), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+
+class RemoteSession:
+    def __init__(self, token, ip):
+        self.token = token
+        self.ip = ip
+        self.last_seen = time.time()
+        self.pages = []
+        self.scanning = False
+        self.stop = threading.Event()
+        self.status = ""
+        self.error = ""
+
+    def drop_pages(self, pages=None):
+        for page in list(pages if pages is not None else self.pages):
+            page["temp"].unlink(missing_ok=True)
+            if page in self.pages:
+                self.pages.remove(page)
+
+
+class ScanHub:
+    """Penghubung antara Pindai di PC scanner dan browser di komputer lain.
+    Kunci `scanner` dipegang selama ada scan, dari mana pun asalnya, agar scanner tidak dipakai dua pihak."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.scanner = threading.Lock()
+        self.cfg = {}
+        self.password_hash = ""
+        self.sessions = {}
+        self.remote_ip = None
+        self.failures = {}
+        self.server = None
+        self.host_name = socket.gethostname()
+
+    @property
+    def running(self):
+        return self.server is not None
+
+    def start(self, port=NET_PORT):
+        if self.server:
+            return
+        server = ThreadingHTTPServer(("0.0.0.0", port), make_handler(self))
+        server.daemon_threads = True
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.server = server
+
+    def stop(self):
+        server, self.server = self.server, None
+        if server:
+            server.shutdown()
+            server.server_close()
+        with self.lock:
+            for sess in self.sessions.values():
+                sess.stop.set()
+                if not sess.scanning:
+                    sess.drop_pages()
+            self.sessions.clear()
+
+    def connected(self):
+        now = time.time()
+        with self.lock:
+            return sum(1 for s in self.sessions.values() if now - s.last_seen < 30)
+
+    def expire(self):
+        now = time.time()
+        with self.lock:
+            for token, sess in list(self.sessions.items()):
+                if not sess.scanning and now - sess.last_seen > SESSION_TTL:
+                    sess.drop_pages()
+                    del self.sessions[token]
+
+    def start_remote_scan(self, sess, overrides):
+        cfg = dict(self.cfg)
+        cfg.update(overrides)
+        if not cfg.get("device_id"):
+            return "Scanner belum dipilih di Pindai pada PC scanner."
+        if not self.scanner.acquire(blocking=False):
+            return self.busy_text(sess)
+        sess.stop = threading.Event()
+        sess.scanning = True
+        sess.error = ""
+        sess.status = "Menarik halaman pertama dari feeder..."
+        self.remote_ip = sess.ip
+        threading.Thread(target=self._remote_job, args=(sess, cfg), daemon=True).start()
+        return None
+
+    def _remote_job(self, sess, cfg):
+        count = blank = 0
+        try:
+            out_q = queue.Queue()
+            worker, dev = worker_for(cfg["device_id"])
+            threading.Thread(target=worker, args=(dev, build_opts(cfg), out_q, sess.stop), daemon=True).start()
+            while True:
+                msg = out_q.get()
+                if msg[0] == "page":
+                    page = msg[1]
+                    page.pop("thumb", None)
+                    page["id"] = secrets.token_hex(6)
+                    count += 1
+                    with self.lock:
+                        sess.pages.append(page)
+                    sess.status = f"{count} halaman masuk..."
+                elif msg[0] == "blank":
+                    blank += 1
+                elif msg[0] == "error":
+                    sess.error = msg[1]
+                elif msg[0] == "note":
+                    sess.error = msg[1]
+                elif msg[0] == "done":
+                    break
+            extra = f", {blank} halaman kosong dibuang" if blank else ""
+            sess.status = f"{count} halaman dipindai{extra}. Periksa, lalu unduh sebagai PDF atau gambar."
+        except Exception as err:
+            sess.error = f"Scan berhenti karena kesalahan: {err}"
+        finally:
+            sess.scanning = False
+            self.remote_ip = None
+            self.scanner.release()
+
+    def busy_text(self, sess=None):
+        if self.remote_ip:
+            who = "Anda" if sess is not None and sess.scanning else f"komputer {self.remote_ip}"
+            return f"Scanner sedang dipakai oleh {who}. Coba lagi setelah selesai."
+        return f"Scanner sedang dipakai di PC {self.host_name}. Coba lagi setelah selesai."
+
+
+def safe_filename(name, fallback):
+    return clean_name(name or "")[:80] or fallback
+
+
+def make_handler(hub):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "Pindai"
+
+        def log_message(self, *args):
+            pass
+
+        def client_ip(self):
+            return self.client_address[0]
+
+        def allowed(self):
+            try:
+                ip = ipaddress.ip_address(self.client_ip())
+            except ValueError:
+                return False
+            return ip.is_private or ip.is_loopback
+
+        def send(self, status, body, ctype="application/json; charset=utf-8", headers=None):
+            if isinstance(body, (dict, list)):
+                body = json.dumps(body).encode("utf-8")
+            elif isinstance(body, str):
+                body = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            for key, value in (headers or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def fail(self, status, text):
+            self.send(status, {"error": text})
+
+        def session(self):
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+            token = cookie["pindai_sid"].value if "pindai_sid" in cookie else ""
+            with hub.lock:
+                sess = hub.sessions.get(token)
+            if sess:
+                sess.last_seen = time.time()
+            return sess
+
+        def body(self):
+            if "application/json" not in self.headers.get("Content-Type", ""):
+                return None
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 8192:
+                return None
+            try:
+                return json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return None
+
+        def find_page(self, sess, page_id):
+            return next((p for p in sess.pages if p["id"] == page_id), None)
+
+        def do_GET(self):
+            if not self.allowed():
+                return self.fail(403, "Hanya bisa dibuka dari jaringan lokal.")
+            url = urlparse(self.path)
+            args = {k: v[0] for k, v in parse_qs(url.query).items()}
+            if url.path == "/":
+                page = WEB_PAGE.replace("{{HOST}}", html.escape(hub.host_name))
+                return self.send(200, page, "text/html; charset=utf-8", {
+                    "Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; style-src 'unsafe-inline'; "
+                                               "script-src 'unsafe-inline'; frame-ancestors 'none'"})
+            if url.path == "/favicon.ico":
+                return self.send(204, b"", "image/x-icon")
+            sess = self.session()
+            if not sess:
+                return self.fail(401, "Masuk dulu dengan password.")
+            if url.path == "/api/state":
+                hub.expire()
+                cfg = hub.cfg
+                return self.send(200, {
+                    "host": hub.host_name,
+                    "device": cfg.get("device_name", ""),
+                    "busy": hub.scanner.locked() and not sess.scanning,
+                    "busy_text": hub.busy_text(sess) if hub.scanner.locked() and not sess.scanning else "",
+                    "scanning": sess.scanning,
+                    "status": sess.status,
+                    "error": sess.error,
+                    "options": {"side": list(SIDES), "color": list(COLOR_MODES), "dpi": RESOLUTIONS,
+                                "paper": list(PAPER_SIZES_IN)},
+                    "defaults": {k: cfg.get(k) for k in ("side", "color", "dpi", "paper")},
+                    "pages": [{"id": p["id"], "size": p.get("size"), "tone": p.get("tone"), "angle": p["angle"],
+                               "auto": p["auto"]} for p in sess.pages],
+                })
+            if url.path in ("/api/thumb", "/api/page"):
+                page = self.find_page(sess, args.get("id", ""))
+                if not page:
+                    return self.fail(404, "Halaman tidak ditemukan.")
+                box = 260 if url.path == "/api/thumb" else 1400
+                try:
+                    data = render_jpeg(page["temp"], page["angle"], box)
+                except OSError:
+                    return self.fail(500, "Gambar halaman tidak bisa dibuka.")
+                return self.send(200, data, "image/jpeg")
+            if url.path == "/api/download":
+                return self.download(sess, args)
+            return self.fail(404, "Tidak ditemukan.")
+
+        def download(self, sess, args):
+            if sess.scanning:
+                return self.fail(409, "Tunggu scan selesai dulu.")
+            pages = list(sess.pages)
+            if not pages:
+                return self.fail(400, "Belum ada halaman untuk diunduh.")
+            fmt = "zip" if args.get("fmt") == "zip" else "pdf"
+            base = safe_filename(args.get("name"), datetime.now().strftime("SCAN_%d%m%y_%H%M%S"))
+            quality = int(hub.cfg.get("quality", 85))
+            out_size = OUTPUT_SIZES.get(hub.cfg.get("out_size", SAME_SIZE))
+            try:
+                if fmt == "pdf":
+                    tmp = WORK_DIR / f"~unduh_{secrets.token_hex(6)}.pdf"
+                    try:
+                        for i, page in enumerate(pages):
+                            out = prepare_page(page["temp"], page["angle"], out_size, page["dpi"])
+                            out.save(tmp, "PDF", append=i > 0, resolution=float(page["dpi"]), quality=quality,
+                                     title=base, creator=APP_NAME)
+                        data = tmp.read_bytes()
+                    finally:
+                        tmp.unlink(missing_ok=True)
+                    filename, ctype = f"{base}.pdf", "application/pdf"
+                else:
+                    buf = io.BytesIO()
+                    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+                        for i, page in enumerate(pages, 1):
+                            out = prepare_page(page["temp"], page["angle"], out_size, page["dpi"])
+                            img = io.BytesIO()
+                            out.save(img, "JPEG", quality=quality, optimize=True, dpi=(page["dpi"], page["dpi"]))
+                            zf.writestr(f"{base}_{i:03d}.jpg", img.getvalue())
+                    data, filename, ctype = buf.getvalue(), f"{base}.zip", "application/zip"
+            except OSError as err:
+                return self.fail(500, f"Berkas gagal dibuat: {err.strerror or err}")
+            ascii_name = filename.encode("ascii", "replace").decode().replace("?", "_").replace('"', "_")
+            self.send(200, data, ctype, {
+                "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(filename)}"})
+
+        def do_POST(self):
+            if not self.allowed():
+                return self.fail(403, "Hanya bisa dibuka dari jaringan lokal.")
+            path = urlparse(self.path).path
+            data = self.body()
+            if data is None:
+                return self.fail(400, "Permintaan tidak valid.")
+            if path == "/api/login":
+                return self.login(data)
+            sess = self.session()
+            if not sess:
+                return self.fail(401, "Masuk dulu dengan password.")
+            if path == "/api/logout":
+                with hub.lock:
+                    hub.sessions.pop(sess.token, None)
+                if not sess.scanning:
+                    sess.drop_pages()
+                return self.send(200, {"ok": True}, headers={
+                    "Set-Cookie": "pindai_sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict"})
+            if path == "/api/scan":
+                if sess.scanning:
+                    return self.fail(409, "Scan Anda masih berjalan.")
+                overrides = {}
+                for key, allowed in (("side", SIDES), ("color", COLOR_MODES), ("dpi", RESOLUTIONS),
+                                     ("paper", PAPER_SIZES_IN)):
+                    if data.get(key) in allowed:
+                        overrides[key] = data[key]
+                problem = hub.start_remote_scan(sess, overrides)
+                if problem:
+                    return self.fail(409, problem)
+                return self.send(200, {"ok": True})
+            if path == "/api/stop":
+                sess.stop.set()
+                sess.status = "Berhenti setelah lembar yang sedang ditarik selesai..."
+                return self.send(200, {"ok": True})
+            if path == "/api/clear":
+                if sess.scanning:
+                    return self.fail(409, "Tunggu scan selesai dulu.")
+                with hub.lock:
+                    sess.drop_pages()
+                sess.status = "Semua halaman dibuang."
+                return self.send(200, {"ok": True})
+            if path in ("/api/rotate", "/api/delete"):
+                page = self.find_page(sess, str(data.get("id", "")))
+                if not page:
+                    return self.fail(404, "Halaman tidak ditemukan.")
+                with hub.lock:
+                    if path == "/api/rotate":
+                        page["angle"] = (page["angle"] + (90 if data.get("delta") == 90 else -90)) % 360
+                    else:
+                        sess.drop_pages([page])
+                return self.send(200, {"ok": True})
+            return self.fail(404, "Tidak ditemukan.")
+
+        def login(self, data):
+            ip = self.client_ip()
+            count, until = hub.failures.get(ip, (0, 0))
+            if until > time.time():
+                return self.fail(429, f"Terlalu banyak percobaan. Coba lagi dalam {int(until - time.time()) + 1} detik.")
+            if not check_password(str(data.get("password", "")), hub.password_hash):
+                count += 1
+                hub.failures[ip] = (count, time.time() + 60 if count >= 5 else 0)
+                return self.fail(403, "Password salah.")
+            hub.failures.pop(ip, None)
+            token = secrets.token_urlsafe(24)
+            with hub.lock:
+                hub.sessions[token] = RemoteSession(token, ip)
+            return self.send(200, {"ok": True}, headers={
+                "Set-Cookie": f"pindai_sid={token}; Path=/; Max-Age={SESSION_TTL}; HttpOnly; SameSite=Strict"})
+
+    return Handler
+
+
+WEB_PAGE = r"""<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pindai di {{HOST}}</title>
+<style>
+:root{--bg:#F4F5F7;--surface:#FFFFFF;--text:#1B1F24;--muted:#555B63;--line:#D5D8DC;--accent:#1F5FA8;
+--accent-hover:#174A84;--on-accent:#FFFFFF;--soft:#E9EAEC;--soft-hover:#DADCE0;--well:#D3D6DA;--danger:#A3262A;--focus:#0B2E57;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#16181B;--surface:#202328;--text:#E8EAED;--muted:#A4AAB2;--line:#3A3F46;
+--accent:#6AA0E0;--accent-hover:#86B2E6;--on-accent:#0B1A2E;--soft:#2C3036;--soft-hover:#363B42;--well:#121417;--danger:#F0959A;--focus:#B9D3F2;color-scheme:dark}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 "Segoe UI",system-ui,-apple-system,Roboto,sans-serif}
+header{background:var(--surface);border-bottom:1px solid var(--line);padding:12px 20px}
+header h1{margin:0;font-size:17px;font-weight:600}
+header p{margin:2px 0 0;color:var(--muted);font-size:13px}
+main{max-width:1100px;margin:0 auto;padding:16px 20px 120px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:16px}
+.controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;align-items:end}
+label{display:block;font-size:13px;color:var(--muted);margin-bottom:4px}
+select,input{width:100%;font:inherit;color:var(--text);background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:8px 10px;min-height:40px}
+button{font:inherit;border:0;border-radius:6px;padding:9px 16px;min-height:40px;cursor:pointer;background:var(--soft);color:var(--text)}
+button:hover{background:var(--soft-hover)}
+button.primary{background:var(--accent);color:var(--on-accent);font-weight:600}
+button.primary:hover{background:var(--accent-hover)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button:focus-visible,select:focus-visible,input:focus-visible,img:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;align-items:center}
+.status{margin:14px 0 0;color:var(--muted);min-height:1.45em}
+.status.error{color:var(--danger)}
+.hint{margin:6px 0 0;color:var(--muted);font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:16px;margin-top:16px}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:10px;text-align:center}
+.tile img{width:100%;height:190px;object-fit:contain;cursor:zoom-in;background:var(--well);border-radius:4px;padding:6px}
+.tile .cap{font-size:12.5px;color:var(--muted);margin:6px 0;min-height:2.9em}
+.tile .tools{display:flex;gap:4px;justify-content:center}
+.tile .tools button{padding:6px 10px;min-height:34px;font-size:14px}
+.empty{text-align:center;color:var(--muted);padding:48px 16px}
+.savebar{position:fixed;left:0;right:0;bottom:0;background:var(--surface);border-top:1px solid var(--line);padding:12px 20px}
+.savebar .inner{max-width:1100px;margin:0 auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.savebar input{flex:1 1 220px;width:auto}
+.login{max-width:380px;margin:60px auto}
+.login h2{margin:0 0 12px;font-size:18px}
+dialog{border:0;border-radius:8px;padding:0;background:var(--surface);color:var(--text);max-width:min(96vw,1000px);width:100%}
+dialog::backdrop{background:rgba(0,0,0,.6)}
+.viewer img{display:block;max-width:100%;max-height:78vh;margin:0 auto;background:#3A3D42}
+.viewer .bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding:10px 12px;border-top:1px solid var(--line)}
+.viewer .bar span{flex:1 1 auto;color:var(--muted);font-size:13px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<header><h1>Pindai</h1><p id="sub">Scanner di PC {{HOST}}</p></header>
+
+<section id="login" class="card login" hidden>
+  <h2>Masuk</h2>
+  <form id="loginForm">
+    <label for="pw">Password dari Pindai di PC {{HOST}}</label>
+    <input id="pw" type="password" autocomplete="current-password" required>
+    <div class="actions"><button class="primary" type="submit">Masuk</button></div>
+    <p id="loginMsg" class="status error" role="alert"></p>
+  </form>
+</section>
+
+<main id="app" hidden>
+  <section class="card">
+    <div class="controls">
+      <div><label for="side">Sisi</label><select id="side"></select></div>
+      <div><label for="color">Mode warna</label><select id="color"></select></div>
+      <div><label for="dpi">Resolusi (DPI)</label><select id="dpi"></select></div>
+      <div><label for="paper">Ukuran input</label><select id="paper"></select></div>
+    </div>
+    <div class="actions">
+      <button id="scan" class="primary" type="button">Scan</button>
+      <button id="stop" type="button" disabled>Berhenti</button>
+    </div>
+    <p class="hint">Taruh dokumen di feeder scanner, menghadap ke atas, lalu tekan Scan.</p>
+    <p id="status" class="status" role="status" aria-live="polite"></p>
+  </section>
+  <div id="grid" class="grid"></div>
+  <p id="empty" class="empty">Belum ada halaman. Hasil scan tampil di sini untuk diperiksa sebelum diunduh.</p>
+</main>
+
+<div id="savebar" class="savebar" hidden>
+  <div class="inner">
+    <input id="name" type="text" placeholder="Nama berkas (boleh kosong)" aria-label="Nama berkas">
+    <button id="pdf" class="primary" type="button">Unduh PDF</button>
+    <button id="zip" type="button">Unduh gambar (ZIP)</button>
+    <button id="clear" type="button">Buang semua</button>
+  </div>
+</div>
+
+<dialog id="viewer" class="viewer" aria-label="Pratinjau halaman">
+  <img id="big" alt="">
+  <div class="bar">
+    <span id="vinfo"></span>
+    <button type="button" id="vprev" aria-label="Halaman sebelumnya">&lsaquo; Sebelumnya</button>
+    <button type="button" id="vnext" aria-label="Halaman berikutnya">Berikutnya &rsaquo;</button>
+    <button type="button" id="vleft">&#8634; Kiri</button>
+    <button type="button" id="vright">&#8635; Kanan</button>
+    <button type="button" id="vdel">Hapus</button>
+    <button type="button" id="vclose">Tutup</button>
+  </div>
+</dialog>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let state = null, timer = null, shown = "", viewIndex = -1, optionsReady = false;
+
+async function api(path, body) {
+  const init = body === undefined ? {} : {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)};
+  const res = await fetch(path, {credentials: "same-origin", ...init});
+  if (res.status === 401) { showLogin(); throw new Error(""); }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || "Permintaan gagal.");
+  return data;
+}
+
+function setStatus(text, isError) {
+  const el = $("#status");
+  el.textContent = text || "";
+  el.classList.toggle("error", !!isError);
+}
+
+function showLogin() {
+  clearTimeout(timer);
+  $("#app").hidden = true; $("#savebar").hidden = true; $("#login").hidden = false;
+  $("#pw").focus();
+}
+
+function fill(select, values, current) {
+  select.innerHTML = "";
+  for (const v of values) select.add(new Option(v, v, false, v === current));
+}
+
+function detail(p) {
+  const parts = [];
+  if (p.size) parts.push(p.size);
+  if (p.angle) parts.push(`diputar ${p.angle}\u00b0` + (p.angle === p.auto ? " otomatis" : ""));
+  if (p.tone) parts.push(p.tone);
+  return parts.join(" \u00b7 ");
+}
+
+function render() {
+  const s = state;
+  $("#sub").textContent = s.device ? `Scanner ${s.device} di PC ${s.host}` : `Scanner di PC ${s.host}`;
+  if (!optionsReady) {
+    for (const key of ["side", "color", "dpi", "paper"]) fill($("#" + key), s.options[key], s.defaults[key]);
+    optionsReady = true;
+  }
+  $("#scan").disabled = s.scanning || s.busy;
+  $("#stop").disabled = !s.scanning;
+  $("#scan").textContent = s.scanning ? "Memindai..." : "Scan";
+  if (s.error) setStatus(s.error, true);
+  else if (s.busy) setStatus(s.busy_text, false);
+  else setStatus(s.status, false);
+
+  const sig = s.pages.map(p => p.id + ":" + p.angle).join(",");
+  if (sig !== shown) {
+    shown = sig;
+    const grid = $("#grid");
+    grid.innerHTML = "";
+    s.pages.forEach((p, i) => {
+      const tile = document.createElement("div");
+      tile.className = "tile";
+      const img = document.createElement("img");
+      img.src = `/api/thumb?id=${p.id}&a=${p.angle}`;
+      img.alt = `Halaman ${i + 1}`;
+      img.tabIndex = 0;
+      img.addEventListener("click", () => openViewer(i));
+      img.addEventListener("keydown", (e) => { if (e.key === "Enter") openViewer(i); });
+      const cap = document.createElement("div");
+      cap.className = "cap";
+      cap.textContent = `Hal. ${i + 1}` + (detail(p) ? `\n${detail(p)}` : "");
+      cap.style.whiteSpace = "pre-line";
+      const tools = document.createElement("div");
+      tools.className = "tools";
+      tools.append(
+        button("\u21ba", `Putar halaman ${i + 1} ke kiri`, () => rotate(p.id, -90)),
+        button("\u21bb", `Putar halaman ${i + 1} ke kanan`, () => rotate(p.id, 90)),
+        button("Hapus", `Hapus halaman ${i + 1}`, () => remove(p.id)));
+      tile.append(img, cap, tools);
+      grid.append(tile);
+    });
+    if ($("#viewer").open) showView();
+  }
+  const has = s.pages.length > 0;
+  $("#empty").hidden = has;
+  $("#savebar").hidden = !has;
+  for (const id of ["#pdf", "#zip", "#clear"]) $(id).disabled = s.scanning;
+}
+
+function button(text, label, onClick) {
+  const b = document.createElement("button");
+  b.type = "button"; b.textContent = text; b.setAttribute("aria-label", label);
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+async function refresh() {
+  clearTimeout(timer);
+  try {
+    state = await api("/api/state");
+    $("#login").hidden = true; $("#app").hidden = false;
+    render();
+    timer = setTimeout(refresh, state.scanning || state.busy ? 1000 : 4000);
+  } catch (e) {
+    if (e.message) { setStatus("Koneksi ke PC scanner terputus. Mencoba lagi...", true); timer = setTimeout(refresh, 3000); }
+  }
+}
+
+async function act(path, body) {
+  try { await api(path, body); } catch (e) { if (e.message) setStatus(e.message, true); }
+  refresh();
+}
+
+const rotate = (id, delta) => act("/api/rotate", {id, delta});
+const remove = (id) => act("/api/delete", {id});
+
+function openViewer(i) { viewIndex = i; showView(); if (!$("#viewer").open) $("#viewer").showModal(); }
+function showView() {
+  const pages = state.pages;
+  if (!pages.length) { $("#viewer").close(); return; }
+  viewIndex = Math.max(0, Math.min(viewIndex, pages.length - 1));
+  const p = pages[viewIndex];
+  $("#big").src = `/api/page?id=${p.id}&a=${p.angle}`;
+  $("#big").alt = `Halaman ${viewIndex + 1}`;
+  $("#vinfo").textContent = `Halaman ${viewIndex + 1} dari ${pages.length}` + (detail(p) ? ` \u00b7 ${detail(p)}` : "");
+}
+function step(d) { viewIndex = (viewIndex + d + state.pages.length) % state.pages.length; showView(); }
+
+$("#vprev").onclick = () => step(-1);
+$("#vnext").onclick = () => step(1);
+$("#vleft").onclick = () => rotate(state.pages[viewIndex].id, -90);
+$("#vright").onclick = () => rotate(state.pages[viewIndex].id, 90);
+$("#vdel").onclick = () => remove(state.pages[viewIndex].id);
+$("#vclose").onclick = () => $("#viewer").close();
+$("#viewer").addEventListener("keydown", (e) => {
+  if (e.key === "ArrowLeft") step(-1);
+  else if (e.key === "ArrowRight") step(1);
+});
+
+$("#loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("#loginMsg").textContent = "";
+  try { await api("/api/login", {password: $("#pw").value}); $("#pw").value = ""; refresh(); }
+  catch (err) { $("#loginMsg").textContent = err.message || "Gagal masuk."; }
+});
+
+$("#scan").onclick = () => {
+  setStatus("Menghubungi scanner...", false);
+  act("/api/scan", {side: $("#side").value, color: $("#color").value, dpi: $("#dpi").value, paper: $("#paper").value});
+};
+$("#stop").onclick = () => act("/api/stop", {});
+$("#clear").onclick = () => { if (confirm(`Buang ${state.pages.length} halaman?`)) act("/api/clear", {}); };
+
+async function download(fmt) {
+  const label = fmt === "pdf" ? "PDF" : "berkas gambar";
+  setStatus(`Menyiapkan ${label}...`, false);
+  for (const id of ["#pdf", "#zip"]) $(id).disabled = true;
+  try {
+    const res = await fetch(`/api/download?fmt=${fmt}&name=${encodeURIComponent($("#name").value)}`, {credentials: "same-origin"});
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "Unduhan gagal.");
+    const blob = await res.blob();
+    const disp = res.headers.get("Content-Disposition") || "";
+    const match = /filename\*=UTF-8''([^;]+)/.exec(disp);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = match ? decodeURIComponent(match[1]) : `scan.${fmt}`;
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    setStatus(`${a.download} sudah diunduh ke komputer ini.`, false);
+  } catch (e) { setStatus(e.message, true); }
+  for (const id of ["#pdf", "#zip"]) $(id).disabled = false;
+}
+$("#pdf").onclick = () => download("pdf");
+$("#zip").onclick = () => download("zip");
+
+refresh();
+</script>
+</body>
+</html>
+"""
+
+
 class Viewer(tk.Toplevel):
     """Tampilan besar satu halaman untuk diperiksa sebelum disimpan."""
 
@@ -1002,6 +1712,9 @@ class App:
         self.close_after_save = False
         self.scan_note = ""
         self.stats = {"pages": 0, "blank": 0, "rotated": 0, "skewed": 0, "gray": 0}
+        self.hub = ScanHub()
+        self.hub.password_hash = self.cfg.get("share_hash", "")
+        self._last_remote = None
 
         shutil.rmtree(WORK_DIR, ignore_errors=True)
 
@@ -1037,12 +1750,22 @@ class App:
         self.var_name = tk.StringVar()
         self.var_status = tk.StringVar()
         self.var_count = tk.StringVar()
+        self.var_share = tk.BooleanVar(value=bool(self.cfg.get("share_enabled")))
+        self.var_share_pw = tk.StringVar()
+        self.var_share_show = tk.BooleanVar(value=False)
+        self.var_pw_hint = tk.StringVar()
+        self.var_net_addr = tk.StringVar()
+        self.var_net_status = tk.StringVar()
 
         self.build()
         self.bind_keys()
         self.refresh_devices()
         self.update_view()
+        if self.var_share.get():
+            self.toggle_share(quiet=True)
+        self.update_net_status()
         root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.tick()
 
     def build(self):
         status = ttk.Frame(self.root, padding=(16, 6, 16, 8))
@@ -1118,6 +1841,38 @@ class App:
             ttk.Checkbutton(out_tab, text=text, variable=var).grid(
                 row=5 + i, column=0, columnspan=2, sticky="w", pady=(6 if i == 0 else 0, 0))
 
+        net_tab = ttk.Frame(tabs, padding=(10, 8))
+        net_tab.columnconfigure(1, weight=1)
+        tabs.add(net_tab, text="Jaringan")
+        ttk.Checkbutton(net_tab, text="Bagikan scanner ke komputer lain", variable=self.var_share,
+                        command=self.toggle_share).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(net_tab, text="Password").grid(row=1, column=0, sticky="w", pady=(8, 2), padx=(0, 10))
+        pw_row = ttk.Frame(net_tab)
+        pw_row.grid(row=1, column=1, sticky="ew", pady=(8, 2))
+        pw_row.columnconfigure(0, weight=1)
+        self.pw_entry = ttk.Entry(pw_row, textvariable=self.var_share_pw, show="\u2022", width=14)
+        self.pw_entry.grid(row=0, column=0, sticky="ew")
+        self.pw_entry.bind("<Return>", lambda e: self.save_share_password())
+        ttk.Button(pw_row, text="Simpan", style="Tool.TButton", command=self.save_share_password).grid(
+            row=0, column=1, padx=(4, 0))
+        ttk.Checkbutton(net_tab, text="Tampilkan password", variable=self.var_share_show,
+                        command=lambda: self.pw_entry.configure(show="" if self.var_share_show.get() else "\u2022")
+                        ).grid(row=2, column=1, sticky="w")
+        ttk.Label(net_tab, textvariable=self.var_pw_hint, style="Muted.TLabel", wraplength=255).grid(
+            row=3, column=0, columnspan=2, sticky="w")
+        ttk.Label(net_tab, text="Alamat").grid(row=4, column=0, sticky="w", pady=(8, 2), padx=(0, 10))
+        addr_row = ttk.Frame(net_tab)
+        addr_row.grid(row=4, column=1, sticky="ew", pady=(8, 2))
+        addr_row.columnconfigure(0, weight=1)
+        ttk.Entry(addr_row, textvariable=self.var_net_addr, state="readonly", width=14).grid(row=0, column=0, sticky="ew")
+        ttk.Button(addr_row, text="Salin", style="Tool.TButton", command=self.copy_address).grid(
+            row=0, column=1, padx=(4, 0))
+        ttk.Label(net_tab, textvariable=self.var_net_status, wraplength=255).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(net_tab, text="Buka alamat ini di browser komputer lain dalam jaringan kantor yang sama. "
+                                "Saat pertama dibagikan, Windows bisa meminta izin firewall: pilih Allow.",
+                  style="Muted.TLabel", wraplength=255).grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
         ttk.Label(side, text="Simpan ke", style="Head.TLabel").grid(row=r, column=0, sticky="w"); r += 1
         f_row = ttk.Frame(side)
         f_row.grid(row=r, column=0, sticky="ew", pady=(4, 6)); r += 1
@@ -1182,6 +1937,89 @@ class App:
                                    "Hasil scan tampil di sini untuk diperiksa sebelum disimpan.")
 
 
+    def save_share_password(self):
+        password = self.var_share_pw.get()
+        if len(password) < 6:
+            self.var_pw_hint.set("Password minimal 6 karakter.")
+            return False
+        changed = bool(self.hub.password_hash)
+        self.hub.password_hash = hash_password(password)
+        self.var_share_pw.set("")
+        if changed:
+            # Password baru: keluarkan sesi lama yang tidak sedang memindai.
+            with self.hub.lock:
+                for token, sess in list(self.hub.sessions.items()):
+                    if not sess.scanning:
+                        sess.drop_pages()
+                        del self.hub.sessions[token]
+        save_settings(self.current_cfg())
+        self.update_net_status()
+        self.set_status("Password jaringan disimpan." + (" Komputer lain perlu masuk lagi." if changed else ""))
+        return True
+
+    def toggle_share(self, quiet=False):
+        if self.var_share.get():
+            if self.var_share_pw.get() and not self.save_share_password():
+                self.var_share.set(False)
+                return
+            if not self.hub.password_hash:
+                self.var_share.set(False)
+                self.var_pw_hint.set("Isi password dulu (minimal 6 karakter), lalu centang lagi.")
+                self.pw_entry.focus_set()
+                return
+            try:
+                self.hub.start()
+            except OSError:
+                self.var_share.set(False)
+                if not quiet:
+                    messagebox.showerror(APP_NAME, f"Port {NET_PORT} sedang dipakai program lain, jadi scanner "
+                                                   "belum bisa dibagikan. Tutup Pindai lain yang terbuka lalu coba lagi.",
+                                         parent=self.root)
+        else:
+            self.hub.stop()
+            self.update_view()
+        save_settings(self.current_cfg())
+        self.update_net_status()
+
+    def copy_address(self):
+        addr = self.var_net_addr.get()
+        if addr.startswith("http"):
+            self.root.clipboard_clear()
+            self.root.clipboard_append(addr.split()[0])
+            self.set_status("Alamat disalin. Tempel di browser komputer lain.")
+
+    def update_net_status(self):
+        self.var_pw_hint.set("Password tersimpan. Ketik password baru lalu Simpan untuk menggantinya."
+                             if self.hub.password_hash else "Minimal 6 karakter. Dipakai untuk masuk dari komputer lain.")
+        if not self.hub.running:
+            self.var_net_addr.set("")
+            self.var_net_status.set("Belum dibagikan.")
+            return
+        ips = lan_addresses()
+        self.var_net_addr.set(f"http://{ips[0]}:{NET_PORT}" if ips else "Tidak tersambung ke jaringan")
+        if self.hub.remote_ip:
+            self.var_net_status.set(f"Sedang memindai untuk komputer {self.hub.remote_ip}.")
+        else:
+            n = self.hub.connected()
+            self.var_net_status.set(f"Aktif. {n} perangkat tersambung." if n else
+                                    "Aktif. Belum ada komputer yang tersambung.")
+
+    def tick(self):
+        snapshot = self.current_cfg()
+        snapshot.pop("share_hash", None)
+        snapshot["device_name"] = self.var_device.get()
+        self.hub.cfg = snapshot
+        remote = self.hub.remote_ip
+        if remote != self._last_remote:
+            self._last_remote = remote
+            self.update_view()
+            if remote:
+                self.set_status(f"Scanner sedang dipakai dari komputer {remote}. Tombol Scan aktif lagi setelah selesai.")
+            elif self.busy is None:
+                self.set_status("Scanner kembali tersedia.")
+        self.update_net_status()
+        self.root.after(1000, self.tick)
+
     def reset_exposure(self):
         self.var_brightness.set(0)
         self.var_contrast.set(0)
@@ -1199,7 +2037,7 @@ class App:
     def update_view(self):
         has = bool(self.pages)
         idle = self.busy is None
-        can_scan = idle and bool(self.devices)
+        can_scan = idle and bool(self.devices) and not self.hub.remote_ip
         self.btn_scan.configure(state="normal" if can_scan else "disabled",
                                 **(SECONDARY_BTN if has else PRIMARY_BTN))
         for btn in (self.btn_save, self.btn_pdf):
@@ -1262,6 +2100,8 @@ class App:
             "contrast": int(self.var_contrast.get()),
             "folder": self.var_folder.get(),
             "save_format": self.cfg.get("save_format", "jpg"),
+            "share_enabled": bool(self.var_share.get()),
+            "share_hash": self.hub.password_hash,
         }
 
     def start_busy(self, kind, text):
@@ -1285,28 +2125,16 @@ class App:
         if not cfg["device_id"]:
             self.set_status("Pilih scanner dulu.")
             return
+        if not self.hub.scanner.acquire(blocking=False):
+            self.set_status(self.hub.busy_text())
+            return
         self.cfg = cfg
         save_settings(cfg)
-        opts = {
-            "paper_name": cfg["paper"],
-            "handling": SIDES[cfg["side"]],
-            "intent": COLOR_MODES[cfg["color"]],
-            "dpi": int(cfg["dpi"]),
-            "paper": PAPER_SIZES_IN[cfg["paper"]],
-            "skip_blank": cfg["skip_blank"],
-            "auto_rotate": cfg["auto_rotate"],
-            "deskew": cfg["deskew"],
-            "auto_color": cfg["color"] == AUTO_COLOR,
-            "bw": cfg["color"] == BW,
-            "brightness": cfg["brightness"],
-            "contrast": cfg["contrast"],
-            "token": datetime.now().strftime("%H%M%S%f"),
-        }
+        opts = build_opts(cfg)
         self.stop_event.clear()
         self.stats = {"pages": 0, "blank": 0, "rotated": 0, "skewed": 0, "gray": 0}
         self.scan_note = ""
-        kind, _, dev = cfg["device_id"].partition(":")
-        worker = twain_worker if kind == "twain" else scan_worker
+        worker, dev = worker_for(cfg["device_id"])
         threading.Thread(target=worker, args=(dev, opts, self.queue, self.stop_event), daemon=True).start()
         self.btn_scan.configure(text="Memindai...")
         self.start_busy("scan", "Menarik halaman pertama dari feeder...")
@@ -1477,6 +2305,10 @@ class App:
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def finish_scan(self):
+        try:
+            self.hub.scanner.release()
+        except RuntimeError:
+            pass
         self.btn_scan.configure(text="Scan  (F5)")
         self.end_busy()
         s = self.stats
@@ -1560,6 +2392,7 @@ class App:
                 self.start_save()
                 return
         save_settings(self.current_cfg())
+        self.hub.stop()
         shutil.rmtree(WORK_DIR, ignore_errors=True)
         self.root.destroy()
 

@@ -32,6 +32,17 @@ Kalau folder dipindah, jalankan `Pasang Pindai.bat` lagi agar shortcut menunjuk 
 | Color Mode: Auto Detect Color | Tab Scan, Mode warna: Otomatis (warna / abu-abu) |
 | Exposure: Default | Tab Hasil, Kecerahan 0 dan Kontras 0 |
 
+## Scan dari komputer lain
+
+PC yang tersambung ke scanner bisa membagikan scannernya ke komputer lain di jaringan kantor yang sama. Komputer lain cukup memakai browser, tanpa memasang apa pun.
+
+1. Di Pindai pada PC scanner, buka tab **Jaringan**, isi password (minimal 6 karakter), lalu centang **Bagikan scanner ke komputer lain**.
+2. Saat pertama kali, Windows bisa meminta izin firewall. Pilih **Allow** untuk jaringan Private.
+3. Salin alamat yang muncul (contoh `http://192.168.1.20:8765`) dan buka di browser komputer lain, lalu masuk dengan password.
+4. Taruh dokumen di feeder, tekan **Scan** di browser, periksa hasilnya, lalu **Unduh PDF** atau **Unduh gambar (ZIP)**. Berkas tersimpan di komputer yang mengunduh.
+
+Scanner hanya bisa dipakai satu pihak dalam satu waktu. Selama scan dari browser berjalan, tombol Scan di PC scanner terkunci, dan sebaliknya. Akses hanya diterima dari alamat jaringan lokal; setelah 5 kali salah password, alamat itu dikunci 60 detik.
+
 ## Pintasan
 
 | Tombol | Fungsi |
