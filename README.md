@@ -1,5 +1,7 @@
 # Pindai
 
+![Pindai: aplikasi scan untuk HP Scanjet Enterprise Flow 7000 s3](preview.png)
+
 Aplikasi scan untuk HP Scanjet Enterprise Flow 7000 s3 di Windows. Hasil scan tampil dulu untuk diperiksa, lalu disimpan sebagai JPG per halaman atau satu PDF.
 
 ## Kebutuhan
@@ -70,6 +72,7 @@ Scanner hanya bisa dipakai satu pihak dalam satu waktu. Selama scan dari browser
 
 - `pindai.py`: aplikasi
 - `pindai.ico`, `pindai.svg`: ikon
+- `preview.png`: gambar pratinjau repo
 - `Pasang Pindai.bat`: pemasang dan pembuat shortcut
 - `Push ke GitHub.bat`: mengirim perubahan ke GitHub
 - `alat/`: pemeriksa driver HP
