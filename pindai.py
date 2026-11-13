@@ -688,6 +688,16 @@ def twain_error_text(err):
         "DeniedError": "Scanner sedang dipakai aplikasi lain. Tutup HP Scan atau aplikasi scan lain lalu coba lagi.",
         "MaxConnectionsError": "Scanner sedang dipakai aplikasi lain. Tutup HP Scan atau aplikasi scan lain lalu coba lagi.",
     }
+    codes = {
+        20: "Kertas macet. Buka penutup feeder, keluarkan kertas, lalu scan ulang dari halaman yang belum masuk.",
+        21: "Dua lembar tertarik sekaligus. Rapikan tumpukan kertas lalu scan ulang halaman terakhir.",
+        23: "Scanner tidak merespons. Periksa daya dan kabel USB, lalu tekan Muat ulang.",
+        24: "Penutup scanner terbuka. Tutup lalu coba lagi.",
+        29: "Tidak ada kertas di feeder. Taruh dokumen lalu tekan Scan lagi.",
+    }
+    found = re.search(r"ConditionCode = (\d+)", str(err))
+    if found and int(found.group(1)) in codes:
+        return codes[int(found.group(1))]
     if is_sequence_error(err):
         return ("Driver HP masih terkunci oleh sesi scan sebelumnya. Tutup HP Scan bila terbuka, matikan scanner, "
                 "tunggu 10 detik, nyalakan lagi, lalu tekan Scan. Rincian galat ada di %APPDATA%\\Pindai\\galat.log.")
@@ -711,7 +721,6 @@ def finish_twain_page(raw, temp, opts):
         if ImageChops.difference(r, g).getbbox() is None and ImageChops.difference(g, b).getbbox() is None:
             im = im.convert("L")
     im.save(temp, "JPEG", quality=TEMP_QUALITY, dpi=(dpi, dpi))
-    raw.unlink(missing_ok=True)
     size = size_label(im.width / dpi, im.height / dpi) if opts["paper"] is None else None
     tone = None
     if opts["auto_color"]:
@@ -737,6 +746,7 @@ def log_error(where, err):
 def twain_session(hwnd, source_name, opts, out_q, stop_event, state):
     """Satu putaran buka driver, atur, lalu scan. state["count"] menghitung halaman yang sudah masuk."""
     sm = src = None
+    leftovers = []
     try:
         sm = twain.SourceManager(hwnd)
         src = sm.open_source(source_name)
@@ -754,9 +764,9 @@ def twain_session(hwnd, source_name, opts, out_q, stop_event, state):
             return str(pending["raw"])
 
         def after(more):
-            state["count"] += 1
             raw = pending.pop("raw")
             temp = raw.with_suffix(".jpg")
+            leftovers.append(raw)
             info = finish_twain_page(raw, temp, opts)
             pending.setdefault("done", []).append(temp)
             try:
@@ -765,6 +775,7 @@ def twain_session(hwnd, source_name, opts, out_q, stop_event, state):
                 thumb = None
             out_q.put(("page", {"temp": temp, "thumb": thumb, "angle": 0, "auto": 0,
                                 "dpi": opts["dpi"], **info}))
+            state["count"] += 1
             if stop_event.is_set() and more:
                 raise twain.exceptions.CancelAll()
 
@@ -775,6 +786,12 @@ def twain_session(hwnd, source_name, opts, out_q, stop_event, state):
                 if obj is not None:
                     obj.close()
             except Exception:
+                pass
+        # BMP mentah baru bisa dihapus setelah driver ditutup dan melepas berkasnya.
+        for raw in leftovers:
+            try:
+                raw.unlink(missing_ok=True)
+            except OSError:
                 pass
 
 
