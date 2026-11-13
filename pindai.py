@@ -2356,7 +2356,22 @@ class App:
     def on_wheel(self, event):
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
+    def restore_keyboard(self):
+        """Kembalikan fokus papan ketik ke jendela utama, yang bisa dicuri driver TWAIN."""
+        try:
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            top = user32.GetAncestor(self.root.winfo_id(), 2)
+            user32.EnableWindow(top, True)
+            user32.SetForegroundWindow(top)
+        except (AttributeError, OSError):
+            pass
+        self.root.focus_force()
+
     def finish_scan(self):
+        self.root.after(150, self.restore_keyboard)
         try:
             self.hub.scanner.release()
         except RuntimeError:
