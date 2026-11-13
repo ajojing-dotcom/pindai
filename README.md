@@ -66,6 +66,7 @@ Scanner hanya bisa dipakai satu pihak dalam satu waktu. Selama scan dari browser
 
 - **Scanner tidak muncul di daftar:** nyalakan scanner, cek kabel USB, tekan Muat ulang.
 - **"Scanner sedang dipakai aplikasi lain":** tutup HP Scan lalu coba lagi.
+- **"Driver HP masih terkunci oleh sesi scan sebelumnya" (Sequence Error):** Pindai sudah mencoba membuka ulang driver satu kali. Bila tetap muncul, tutup HP Scan, matikan scanner, tunggu 10 detik, nyalakan lagi, lalu scan. Galat lengkap dicatat di `%APPDATA%\Pindai\galat.log`.
 - **Driver HP tidak terdeteksi:** jalankan `alat/Cek Driver HP.bat` dan periksa laporan di Desktop.
 
 ## Isi folder

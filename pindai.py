@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import zipfile
 from datetime import datetime
 from http.cookies import SimpleCookie
@@ -687,7 +688,11 @@ def twain_error_text(err):
         "DeniedError": "Scanner sedang dipakai aplikasi lain. Tutup HP Scan atau aplikasi scan lain lalu coba lagi.",
         "MaxConnectionsError": "Scanner sedang dipakai aplikasi lain. Tutup HP Scan atau aplikasi scan lain lalu coba lagi.",
     }
-    return known.get(name, f"Driver HP menolak perintah ({name}). Matikan lalu nyalakan scanner, kemudian coba lagi.")
+    if is_sequence_error(err):
+        return ("Driver HP masih terkunci oleh sesi scan sebelumnya. Tutup HP Scan bila terbuka, matikan scanner, "
+                "tunggu 10 detik, nyalakan lagi, lalu tekan Scan. Rincian galat ada di %APPDATA%\\Pindai\\galat.log.")
+    return known.get(name, f"Driver HP menolak perintah ({name}). Matikan lalu nyalakan scanner, kemudian coba lagi. "
+                           "Rincian galat ada di %APPDATA%\\Pindai\\galat.log.")
 
 
 def finish_twain_page(raw, temp, opts):
@@ -714,13 +719,25 @@ def finish_twain_page(raw, temp, opts):
     return {"size": size, "skew": 0.0, "tone": tone, "engine": "hp"}
 
 
-def twain_worker(source_name, opts, out_q, stop_event):
-    """Scan lewat driver TWAIN HP di thread sendiri. Pesan antrean sama dengan scan_worker."""
-    count = 0
-    hwnd = hidden_window()
+def is_sequence_error(err):
+    return "seq" in type(err).__name__.lower()
+
+
+def log_error(where, err):
+    """Catat galat lengkap ke galat.log di folder pengaturan agar penyebabnya bisa dilacak."""
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        with open(SETTINGS_DIR / "galat.log", "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [{where}] {type(err).__name__}: {err}\n")
+            fh.write("".join(traceback.format_exception(type(err), err, err.__traceback__)) + "\n")
+    except OSError:
+        pass
+
+
+def twain_session(hwnd, source_name, opts, out_q, stop_event, state):
+    """Satu putaran buka driver, atur, lalu scan. state["count"] menghitung halaman yang sudah masuk."""
     sm = src = None
     try:
-        WORK_DIR.mkdir(parents=True, exist_ok=True)
         sm = twain.SourceManager(hwnd)
         src = sm.open_source(source_name)
         if src is None:
@@ -737,8 +754,7 @@ def twain_worker(source_name, opts, out_q, stop_event):
             return str(pending["raw"])
 
         def after(more):
-            nonlocal count
-            count += 1
+            state["count"] += 1
             raw = pending.pop("raw")
             temp = raw.with_suffix(".jpg")
             info = finish_twain_page(raw, temp, opts)
@@ -753,7 +769,31 @@ def twain_worker(source_name, opts, out_q, stop_event):
                 raise twain.exceptions.CancelAll()
 
         src.acquire_file(before=before, after=after, show_ui=False, modal=False)
-        if count == 0 and not stop_event.is_set():
+    finally:
+        for obj in (src, sm):
+            try:
+                if obj is not None:
+                    obj.close()
+            except Exception:
+                pass
+
+
+def twain_worker(source_name, opts, out_q, stop_event):
+    """Scan lewat driver TWAIN HP di thread sendiri. Pesan antrean sama dengan scan_worker."""
+    state = {"count": 0}
+    hwnd = hidden_window()
+    try:
+        WORK_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            twain_session(hwnd, source_name, opts, out_q, stop_event, state)
+        except Exception as err:
+            # Sesi lama yang menggantung memicu galat urutan. Ulangi sekali setelah driver dilepas.
+            if not (is_sequence_error(err) and state["count"] == 0):
+                raise
+            log_error("twain, percobaan 1", err)
+            time.sleep(2)
+            twain_session(hwnd, source_name, opts, out_q, stop_event, state)
+        if state["count"] == 0 and not stop_event.is_set():
             raise ScanError("Tidak ada halaman yang masuk. Pastikan dokumen ada di feeder, lalu tekan Scan lagi. "
                              "Bila Buang halaman kosong aktif, semua halaman mungkin terdeteksi kosong.")
     except ScanError as err:
@@ -762,16 +802,11 @@ def twain_worker(source_name, opts, out_q, stop_event):
         if HAS_TWAIN and isinstance(err, twain.exceptions.CancelAll):
             pass
         else:
+            log_error("twain", err)
             out_q.put(("error", twain_error_text(err)))
     finally:
-        for obj in (src, sm):
-            try:
-                if obj is not None:
-                    obj.close()
-            except Exception:
-                pass
         destroy_window(hwnd)
-        out_q.put(("done", count))
+        out_q.put(("done", state["count"]))
 
 
 def scan_worker(device_id, opts, out_q, stop_event):
